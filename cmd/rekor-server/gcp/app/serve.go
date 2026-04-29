@@ -18,8 +18,7 @@ package app
 import (
 	"context"
 	"crypto"
-	"crypto/x509"
-	"encoding/base64"
+	"fmt"
 	"log/slog"
 	"os"
 	"time"
@@ -65,55 +64,135 @@ var serveCmd = &cobra.Command{
 
 		slog.Info("starting rekor-server", "version", version.GetVersionInfo())
 
-		var signerOpts []signerverifier.Option
-		switch {
-		case viper.GetString("signer-filepath") != "":
-			signerOpts = []signerverifier.Option{signerverifier.WithFile(viper.GetString("signer-filepath"), viper.GetString("signer-password"))}
-		case viper.GetString("signer-kmskey") != "":
-			kmshash := viper.GetString("signer-kmshash")
-			hashAlg, ok := hashAlgMap[kmshash]
-			if !ok {
-				slog.Error("invalid hash algorithm for --signer-kmshash", "algorithm", kmshash)
+		// Parse signer configuration(s)
+		// Check for hybrid mode first (multiple signers)
+		signerFilepaths := viper.GetStringSlice("signer-filepaths")
+		signerKMSKeys := viper.GetStringSlice("signer-kmskeys")
+		signerKMSHashes := viper.GetStringSlice("signer-kmshashes")
+
+		var signers []signature.Signer
+		var err error
+
+		if len(signerFilepaths) > 0 || len(signerKMSKeys) > 0 {
+			// Multiple signer mode: Use --signer-filepaths and/or --signer-kmskeys
+			if len(signerFilepaths)+len(signerKMSKeys) > 1 {
+				slog.Info("Initializing hybrid signing mode", "file_signers", len(signerFilepaths), "kms_signers", len(signerKMSKeys))
+			} else {
+				slog.Info("Initializing single signer")
+			}
+
+			signerOpts := make([][]signerverifier.Option, 0)
+
+			// Add file-based signers
+			for i, filepath := range signerFilepaths {
+				if filepath != "" {
+					password := ""
+					if passwords := viper.GetStringSlice("signer-passwords"); i < len(passwords) {
+						password = passwords[i]
+					}
+					signerOpts = append(signerOpts, []signerverifier.Option{
+						signerverifier.WithFile(filepath, password),
+					})
+				}
+			}
+
+			// Add KMS signers
+			for i, kmsKey := range signerKMSKeys {
+				if kmsKey != "" {
+					// Get hash algorithm for this KMS key
+					hashAlg := crypto.SHA256 // default
+					if i < len(signerKMSHashes) {
+						if h, ok := hashAlgMap[signerKMSHashes[i]]; ok {
+							hashAlg = h
+						}
+					}
+
+					// Configure RPC options for GCP KMS
+					rpcOpts := make([]signature.RPCOption, 0)
+					callOpts := []grpc_retry.CallOption{
+						grpc_retry.WithMax(viper.GetUint("gcp-kms-retries")),
+						grpc_retry.WithPerRetryTimeout(time.Duration(viper.GetUint32("gcp-kms-timeout")) * time.Second)}
+					rpcOpts = append(rpcOpts, gcp.WithGoogleAPIClientOption(
+						option.WithGRPCDialOption(grpc.WithUnaryInterceptor(grpc_retry.UnaryClientInterceptor(callOpts...)))))
+
+					signerOpts = append(signerOpts, []signerverifier.Option{
+						signerverifier.WithKMS(kmsKey, hashAlg, rpcOpts),
+					})
+				}
+			}
+
+			if len(signerOpts) == 0 {
+				slog.Error("hybrid mode enabled but no valid signers configured")
 				os.Exit(1)
 			}
-			// initialize optional RPC options for GCP KMS
-			rpcOpts := make([]signature.RPCOption, 0)
-			callOpts := []grpc_retry.CallOption{grpc_retry.WithMax(viper.GetUint("gcp-kms-retries")), grpc_retry.WithPerRetryTimeout(time.Duration(viper.GetUint32("gcp-kms-timeout")) * time.Second)}
-			rpcOpts = append(rpcOpts, gcp.WithGoogleAPIClientOption(option.WithGRPCDialOption(grpc.WithUnaryInterceptor(grpc_retry.UnaryClientInterceptor(callOpts...)))))
 
-			signerOpts = []signerverifier.Option{signerverifier.WithKMS(viper.GetString("signer-kmskey"), hashAlg, rpcOpts)}
-		case viper.GetString("signer-tink-kek-uri") != "":
-			signerOpts = []signerverifier.Option{signerverifier.WithTink(viper.GetString("signer-tink-kek-uri"), viper.GetString("signer-tink-keyset-path"))}
-		default:
-			slog.Error("no signer configured; must provide a signer using a file, KMS, or Tink")
-			os.Exit(1)
-		}
-		signer, err := signerverifier.New(ctx, signerOpts...)
-		if err != nil {
-			slog.Error("failed to initialize signer", "error", err)
-			os.Exit(1)
-		}
-		pubkey, err := signer.PublicKey()
-		if err != nil {
-			slog.Error("failed to get public key from signing key", "error", err)
-			os.Exit(1)
-		}
-		der, err := x509.MarshalPKIXPublicKey(pubkey)
-		if err != nil {
-			slog.Error("failed to marshal public key to DER", "error", err)
-			os.Exit(1)
-		}
-		slog.Info("Loaded signing key", "pubkey in base64 DER", base64.StdEncoding.EncodeToString(der))
+			signers, err = signerverifier.NewMultiple(ctx, signerOpts...)
+			if err != nil {
+				slog.Error("failed to initialize hybrid signers", "error", err)
+				os.Exit(1)
+			}
 
-		appendOptions, err := tessera.NewAppendOptions(ctx, viper.GetString("hostname"), signer)
+			slog.Info("Hybrid signers initialized", "count", len(signers))
+		} else {
+			// Single signer mode (backwards compatible)
+			var signerOpts []signerverifier.Option
+			switch {
+			case viper.GetString("signer-filepath") != "":
+				signerOpts = []signerverifier.Option{
+					signerverifier.WithFile(viper.GetString("signer-filepath"), viper.GetString("signer-password"))}
+			case viper.GetString("signer-kmskey") != "":
+				kmshash := viper.GetString("signer-kmshash")
+				hashAlg, ok := hashAlgMap[kmshash]
+				if !ok {
+					slog.Error("invalid hash algorithm for --signer-kmshash", "algorithm", kmshash)
+					os.Exit(1)
+				}
+				rpcOpts := make([]signature.RPCOption, 0)
+				callOpts := []grpc_retry.CallOption{
+					grpc_retry.WithMax(viper.GetUint("gcp-kms-retries")),
+					grpc_retry.WithPerRetryTimeout(time.Duration(viper.GetUint32("gcp-kms-timeout")) * time.Second)}
+				rpcOpts = append(rpcOpts, gcp.WithGoogleAPIClientOption(
+					option.WithGRPCDialOption(grpc.WithUnaryInterceptor(grpc_retry.UnaryClientInterceptor(callOpts...)))))
+				signerOpts = []signerverifier.Option{
+					signerverifier.WithKMS(viper.GetString("signer-kmskey"), hashAlg, rpcOpts)}
+			case viper.GetString("signer-tink-kek-uri") != "":
+				signerOpts = []signerverifier.Option{
+					signerverifier.WithTink(viper.GetString("signer-tink-kek-uri"), viper.GetString("signer-tink-keyset-path"))}
+			default:
+				slog.Error("no signer configured; must provide a signer using a file, KMS, or Tink")
+				os.Exit(1)
+			}
+
+			signer, err := signerverifier.New(ctx, signerOpts...)
+			if err != nil {
+				slog.Error("failed to initialize signer", "error", err)
+				os.Exit(1)
+			}
+			signers = []signature.Signer{signer}
+		}
+
+		// Log all public keys for verification
+		for i, signer := range signers {
+			pubkey, err := signer.PublicKey()
+			if err != nil {
+				slog.Error("failed to get public key from signing key", "signer", i, "error", err)
+				os.Exit(1)
+			}
+			slog.Info("Loaded signing key", "signer", i, "algorithm", fmt.Sprintf("%T", pubkey))
+		}
+
+		// Create append options with signers (handles both single and hybrid modes)
+		appendOptions, err := tessera.NewAppendOptionsMulti(ctx, viper.GetString("hostname"), signers)
 		if err != nil {
 			slog.Error("failed to initialize append options", "error", err)
 			os.Exit(1)
 		}
+
 		// Compute log ID for TransparencyLogEntry, to be used by clients to look up
 		// the correct instance in a trust root. Log ID is equivalent to the non-truncated
 		// hash of the public key and origin per the signed-note C2SP spec.
-		pubKey, err := signer.PublicKey(options.WithContext(ctx))
+		// Use the first signer's public key for backwards compatibility
+		pubKey, err := signers[0].PublicKey(options.WithContext(ctx))
 		if err != nil {
 			slog.Error("failed to get public key", "error", err)
 			os.Exit(1)
@@ -216,6 +295,11 @@ func init() {
 	serveCmd.Flags().String("signer-tink-keyset-path", "", "path to encrypted Tink keyset")
 	serveCmd.Flags().Uint("gcp-kms-retries", 0, "number of retries for GCP KMS requests")
 	serveCmd.Flags().Uint32("gcp-kms-timeout", 0, "sets the RPC timeout per call for GCP KMS requests in seconds, defaults to 0 (no timeout)")
+	// Hybrid signing configuration (multiple signers)
+	serveCmd.Flags().StringSlice("signer-filepaths", []string{}, "paths to signing keys (for hybrid mode)")
+	serveCmd.Flags().StringSlice("signer-passwords", []string{}, "passwords for signing keys (for hybrid mode)")
+	serveCmd.Flags().StringSlice("signer-kmskeys", []string{}, "KMS key URIs (for hybrid mode)")
+	serveCmd.Flags().StringSlice("signer-kmshashes", []string{}, "hash algorithms for KMS keys (for hybrid mode)")
 
 	if err := viper.BindPFlags(serveCmd.Flags()); err != nil {
 		slog.Error(err.Error())

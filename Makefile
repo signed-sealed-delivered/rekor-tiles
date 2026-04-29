@@ -76,22 +76,22 @@ gosec: ## Run gosec security scanner
 	$(GOBIN)/gosec ./...
 
 rekor-server-gcp: $(SRC) $(PROTO_SRC)
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(SERVER_LDFLAGS)" -o rekor-server-gcp ./cmd/rekor-server/gcp
+	CGO_ENABLED=0 go build -tags pq_circl -trimpath -ldflags "$(SERVER_LDFLAGS)" -o rekor-server-gcp ./cmd/rekor-server/gcp
 
 rekor-server-posix: $(SRC) $(PROTO_SRC)
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(SERVER_LDFLAGS)" -o rekor-server-posix ./cmd/rekor-server/posix
+	CGO_ENABLED=0 go build -tags pq_circl -trimpath -ldflags "$(SERVER_LDFLAGS)" -o rekor-server-posix ./cmd/rekor-server/posix
 
 rekor-server-aws: $(SRC) $(PROTO_SRC)
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(SERVER_LDFLAGS)" -o rekor-server-aws ./cmd/rekor-server/aws
+	CGO_ENABLED=0 go build -tags pq_circl -trimpath -ldflags "$(SERVER_LDFLAGS)" -o rekor-server-aws ./cmd/rekor-server/aws
 
 rekor-server-gcpcloudsql: $(SRC) $(PROTO_SRC)
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(SERVER_LDFLAGS)" -o rekor-server-gcpcloudsql ./cmd/rekor-server/gcpcloudsql
+	CGO_ENABLED=0 go build -tags pq_circl -trimpath -ldflags "$(SERVER_LDFLAGS)" -o rekor-server-gcpcloudsql ./cmd/rekor-server/gcpcloudsql
 
 ldflags: ## Print ldflags
 	@echo $(SERVER_LDFLAGS)
 
 test: ## Run all tests
-	go test ./...
+	go test -tags pq_circl ./...
 
 ko-local: ## Build container images locally using ko, defaulting to the GCP container
 	KO_DOCKER_REPO=ko.local LDFLAGS="$(SERVER_LDFLAGS)" GIT_HASH=$(GIT_HASH) GIT_VERSION=$(GIT_VERSION) \

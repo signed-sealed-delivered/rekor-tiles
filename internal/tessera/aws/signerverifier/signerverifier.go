@@ -88,3 +88,22 @@ func WithTink(kekURI, keysetPath string) Option {
 		sc.tinkKeysetPath = keysetPath
 	}
 }
+
+// NewMultiple creates multiple signers for AWS backend.
+// Supports file-based, AWS KMS, and Tink signers.
+func NewMultiple(ctx context.Context, opts ...[]Option) ([]signature.Signer, error) {
+	if len(opts) == 0 {
+		return nil, fmt.Errorf("no signer options provided")
+	}
+
+	signers := make([]signature.Signer, 0, len(opts))
+	for i, signerOpts := range opts {
+		signer, err := New(ctx, signerOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("creating signer %d: %w", i, err)
+		}
+		signers = append(signers, signer)
+	}
+
+	return signers, nil
+}

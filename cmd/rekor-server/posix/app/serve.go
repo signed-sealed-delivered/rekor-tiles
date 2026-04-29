@@ -17,7 +17,6 @@ package app
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/base64"
 	"log/slog"
 	"os"
@@ -35,6 +34,8 @@ import (
 	"github.com/sigstore/rekor-tiles/v2/internal/tessera"
 	posixDriver "github.com/sigstore/rekor-tiles/v2/internal/tessera/posix"
 	"github.com/sigstore/rekor-tiles/v2/pkg/note"
+	"github.com/sigstore/sigstore/pkg/cryptoutils"
+	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/signature/options"
 )
 
@@ -57,36 +58,87 @@ var serveCmd = &cobra.Command{
 
 		slog.Info("starting rekor-server", "version", version.GetVersionInfo())
 
-		if viper.GetString("signer-filepath") == "" {
-			slog.Error("--signer-filepath must be set")
-			os.Exit(1)
-		}
-		signer, err := signerverifier.NewFileSignerVerifier(viper.GetString("signer-filepath"), viper.GetString("signer-password"))
-		if err != nil {
-			slog.Error("failed to initialize signer", "error", err)
-			os.Exit(1)
-		}
-		pubkey, err := signer.PublicKey()
-		if err != nil {
-			slog.Error("failed to get public key from signing key", "error", err)
-			os.Exit(1)
-		}
-		der, err := x509.MarshalPKIXPublicKey(pubkey)
-		if err != nil {
-			slog.Error("failed to marshal public key to DER", "error", err)
-			os.Exit(1)
-		}
-		slog.Info("Loaded signing key", "pubkey in base64 DER", base64.StdEncoding.EncodeToString(der))
+		// Parse signer configuration(s)
+		// Check for hybrid mode first (multiple file-based signers)
+		signerFilepaths := viper.GetStringSlice("signer-filepaths")
+		signerPasswords := viper.GetStringSlice("signer-passwords")
 
-		appendOptions, err := tessera.NewAppendOptions(ctx, viper.GetString("hostname"), signer)
+		var signers []signature.Signer
+		var err error
+
+		if len(signerFilepaths) > 0 {
+			// File-based signer(s): Use --signer-filepaths (one or more)
+			if len(signerFilepaths) > 1 {
+				slog.Info("Initializing hybrid signing mode (file-based)", "signers", len(signerFilepaths))
+			} else {
+				slog.Info("Initializing single signer (file-based)")
+			}
+
+			signers = make([]signature.Signer, 0, len(signerFilepaths))
+			for i, filepath := range signerFilepaths {
+				if filepath == "" {
+					continue
+				}
+				password := ""
+				if i < len(signerPasswords) {
+					password = signerPasswords[i]
+				}
+
+				signer, err := signerverifier.NewFileSignerVerifier(filepath, password)
+				if err != nil {
+					slog.Error("failed to initialize signer", "index", i, "filepath", filepath, "error", err)
+					os.Exit(1)
+				}
+				signers = append(signers, signer)
+			}
+
+			if len(signers) == 0 {
+				slog.Error("hybrid mode enabled but no valid file signers configured")
+				os.Exit(1)
+			}
+
+			slog.Info("Hybrid signers initialized", "count", len(signers))
+		} else {
+			// Single signer mode (backwards compatible)
+			if viper.GetString("signer-filepath") == "" {
+				slog.Error("--signer-filepath must be set")
+				os.Exit(1)
+			}
+			signer, err := signerverifier.NewFileSignerVerifier(viper.GetString("signer-filepath"), viper.GetString("signer-password"))
+			if err != nil {
+				slog.Error("failed to initialize signer", "error", err)
+				os.Exit(1)
+			}
+			signers = []signature.Signer{signer}
+		}
+
+		// Log all public keys for verification
+		for i, signer := range signers {
+			pubkey, err := signer.PublicKey()
+			if err != nil {
+				slog.Error("failed to get public key from signing key", "signer", i, "error", err)
+				os.Exit(1)
+			}
+			der, err := cryptoutils.MarshalPublicKeyToDER(pubkey)
+			if err != nil {
+				slog.Error("failed to marshal public key to DER", "signer", i, "error", err)
+				os.Exit(1)
+			}
+			slog.Info("Loaded signing key", "signer", i, "pubkey in base64 DER", base64.StdEncoding.EncodeToString(der))
+		}
+
+		// Create append options with signers (handles both single and hybrid modes)
+		appendOptions, err := tessera.NewAppendOptionsMulti(ctx, viper.GetString("hostname"), signers)
 		if err != nil {
 			slog.Error("failed to initialize append options", "error", err)
 			os.Exit(1)
 		}
+
 		// Compute log ID for TransparencyLogEntry, to be used by clients to look up
 		// the correct instance in a trust root. Log ID is equivalent to the non-truncated
 		// hash of the public key and origin per the signed-note C2SP spec.
-		pubKey, err := signer.PublicKey(options.WithContext(ctx))
+		// Use the first signer's public key for backwards compatibility
+		pubKey, err := signers[0].PublicKey(options.WithContext(ctx))
 		if err != nil {
 			slog.Error("failed to get public key", "error", err)
 			os.Exit(1)
@@ -179,6 +231,9 @@ func init() {
 	// checkpoint signing configs
 	serveCmd.Flags().String("signer-filepath", "", "path to the signing key")
 	serveCmd.Flags().String("signer-password", "", "password to decrypt the signing key")
+	// Hybrid signing configuration (multiple signers)
+	serveCmd.Flags().StringSlice("signer-filepaths", []string{}, "paths to signing keys (for hybrid mode)")
+	serveCmd.Flags().StringSlice("signer-passwords", []string{}, "passwords for signing keys (for hybrid mode)")
 
 	if err := viper.BindPFlags(serveCmd.Flags()); err != nil {
 		slog.Error(err.Error())

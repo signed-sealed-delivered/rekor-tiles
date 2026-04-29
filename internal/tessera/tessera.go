@@ -30,6 +30,7 @@ import (
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/client"
+	xnote "golang.org/x/mod/sumdb/note"
 )
 
 const (
@@ -85,6 +86,37 @@ func NewAppendOptions(ctx context.Context, origin string, signer signature.Signe
 		return nil, fmt.Errorf("getting note signer: %w", err)
 	}
 	opts = opts.WithCheckpointSigner(noteSigner)
+	return opts, nil
+}
+
+// NewAppendOptionsMulti initializes Tessera append options with multiple checkpoint signers
+// for hybrid post-quantum signing. All signers will sign each checkpoint.
+// Uses Tessera's native multiple signer support via WithCheckpointSigner(first, additional...).
+func NewAppendOptionsMulti(ctx context.Context, origin string, signers []signature.Signer) (*tessera.AppendOptions, error) {
+	if len(signers) == 0 {
+		return nil, fmt.Errorf("no signers provided")
+	}
+
+	// Convert all signature.Signers to xnote.Signers (from golang.org/x/mod/sumdb/note)
+	noteSigners := make([]xnote.Signer, len(signers))
+	for i, signer := range signers {
+		noteSigner, err := note.NewNoteSigner(ctx, origin, signer)
+		if err != nil {
+			return nil, fmt.Errorf("creating note signer %d: %w", i, err)
+		}
+		noteSigners[i] = noteSigner
+	}
+
+	opts := tessera.NewAppendOptions()
+
+	// Tessera natively supports multiple signers via additionalSigners variadic parameter
+	if len(noteSigners) == 1 {
+		opts = opts.WithCheckpointSigner(noteSigners[0])
+	} else {
+		// First signer + rest as additional signers
+		opts = opts.WithCheckpointSigner(noteSigners[0], noteSigners[1:]...)
+	}
+
 	return opts, nil
 }
 
