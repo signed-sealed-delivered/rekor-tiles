@@ -17,7 +17,7 @@ package app
 
 import (
 	"context"
-	"encoding/base64"
+	"fmt"
 	"log/slog"
 	"os"
 
@@ -30,11 +30,11 @@ import (
 	"github.com/sigstore/rekor-tiles/v2/internal/algorithmregistry"
 	"github.com/sigstore/rekor-tiles/v2/internal/cli"
 	"github.com/sigstore/rekor-tiles/v2/internal/server"
+	"github.com/sigstore/rekor-tiles/v2/internal/signersetup"
 	"github.com/sigstore/rekor-tiles/v2/internal/signerverifier"
 	"github.com/sigstore/rekor-tiles/v2/internal/tessera"
 	posixDriver "github.com/sigstore/rekor-tiles/v2/internal/tessera/posix"
 	"github.com/sigstore/rekor-tiles/v2/pkg/note"
-	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/signature/options"
 )
@@ -59,45 +59,35 @@ var serveCmd = &cobra.Command{
 		slog.Info("starting rekor-server", "version", version.GetVersionInfo())
 
 		// Parse signer configuration(s)
-		// Check for hybrid mode first (multiple file-based signers)
-		signerFilepaths := viper.GetStringSlice("signer-filepaths")
-		signerPasswords := viper.GetStringSlice("signer-passwords")
-
 		var signers []signature.Signer
 		var err error
 
+		// POSIX signer factory (file-based only)
+		posixSignerFactory := func(_ context.Context, opts interface{}) (signature.Signer, error) {
+			switch o := opts.(type) {
+			case signersetup.FileSignerOpts:
+				return signerverifier.NewFileSignerVerifier(o.FilePath, o.Password)
+			default:
+				return nil, fmt.Errorf("POSIX backend only supports file-based signers, got: %T", opts)
+			}
+		}
+
+		// Check for hybrid mode (multiple file-based signers)
+		signerFilepaths := viper.GetStringSlice("signer-filepaths")
+
 		if len(signerFilepaths) > 0 {
-			// File-based signer(s): Use --signer-filepaths (one or more)
-			if len(signerFilepaths) > 1 {
-				slog.Info("Initializing hybrid signing mode (file-based)", "signers", len(signerFilepaths))
-			} else {
-				slog.Info("Initializing single signer (file-based)")
+			// Hybrid mode using common setup (file-based only)
+			cfg := signersetup.Config{
+				FilePaths:    signerFilepaths,
+				Passwords:    viper.GetStringSlice("signer-passwords"),
+				CreateSigner: posixSignerFactory,
 			}
 
-			signers = make([]signature.Signer, 0, len(signerFilepaths))
-			for i, filepath := range signerFilepaths {
-				if filepath == "" {
-					continue
-				}
-				password := ""
-				if i < len(signerPasswords) {
-					password = signerPasswords[i]
-				}
-
-				signer, err := signerverifier.NewFileSignerVerifier(filepath, password)
-				if err != nil {
-					slog.Error("failed to initialize signer", "index", i, "filepath", filepath, "error", err)
-					os.Exit(1)
-				}
-				signers = append(signers, signer)
-			}
-
-			if len(signers) == 0 {
-				slog.Error("hybrid mode enabled but no valid file signers configured")
+			signers, err = signersetup.InitializeSigners(ctx, cfg)
+			if err != nil {
+				slog.Error("failed to initialize signers", "error", err)
 				os.Exit(1)
 			}
-
-			slog.Info("Hybrid signers initialized", "count", len(signers))
 		} else {
 			// Single signer mode (backwards compatible)
 			if viper.GetString("signer-filepath") == "" {
@@ -113,18 +103,9 @@ var serveCmd = &cobra.Command{
 		}
 
 		// Log all public keys for verification
-		for i, signer := range signers {
-			pubkey, err := signer.PublicKey()
-			if err != nil {
-				slog.Error("failed to get public key from signing key", "signer", i, "error", err)
-				os.Exit(1)
-			}
-			der, err := cryptoutils.MarshalPublicKeyToDER(pubkey)
-			if err != nil {
-				slog.Error("failed to marshal public key to DER", "signer", i, "error", err)
-				os.Exit(1)
-			}
-			slog.Info("Loaded signing key", "signer", i, "pubkey in base64 DER", base64.StdEncoding.EncodeToString(der))
+		if err := signersetup.LogPublicKeys(signers); err != nil {
+			slog.Error("failed to log public keys", "error", err)
+			os.Exit(1)
 		}
 
 		// Create append options with signers (handles both single and hybrid modes)
