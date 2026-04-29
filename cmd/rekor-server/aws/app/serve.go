@@ -17,9 +17,7 @@ package app
 
 import (
 	"context"
-	"crypto"
-	"crypto/x509"
-	"encoding/base64"
+	"fmt"
 	"log/slog"
 	"os"
 
@@ -32,10 +30,12 @@ import (
 	"github.com/sigstore/rekor-tiles/v2/internal/algorithmregistry"
 	"github.com/sigstore/rekor-tiles/v2/internal/cli"
 	"github.com/sigstore/rekor-tiles/v2/internal/server"
+	"github.com/sigstore/rekor-tiles/v2/internal/signersetup"
 	"github.com/sigstore/rekor-tiles/v2/internal/tessera"
 	awsDriver "github.com/sigstore/rekor-tiles/v2/internal/tessera/aws"
 	"github.com/sigstore/rekor-tiles/v2/internal/tessera/aws/signerverifier"
 	"github.com/sigstore/rekor-tiles/v2/pkg/note"
+	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/signature/options"
 )
 
@@ -58,51 +58,88 @@ var serveCmd = &cobra.Command{
 
 		slog.Info("starting rekor-server", "version", version.GetVersionInfo())
 
-		var signerOpts []signerverifier.Option
-		switch {
-		case viper.GetString("signer-filepath") != "":
-			signerOpts = []signerverifier.Option{signerverifier.WithFile(viper.GetString("signer-filepath"), viper.GetString("signer-password"))}
-		case viper.GetString("signer-kmskey") != "":
-			kmshash := viper.GetString("signer-kmshash")
-			hashAlg, ok := hashAlgMap[kmshash]
-			if !ok {
-				slog.Error("invalid hash algorithm for --signer-kmshash", "algorithm", kmshash)
+		// Parse signer configuration(s)
+		var signers []signature.Signer
+		var err error
+
+		// AWS signer factory
+		awsSignerFactory := func(ctx context.Context, opts interface{}) (signature.Signer, error) {
+			switch o := opts.(type) {
+			case signersetup.FileSignerOpts:
+				return signerverifier.New(ctx, signerverifier.WithFile(o.FilePath, o.Password))
+			case signersetup.KMSSignerOpts:
+				return signerverifier.New(ctx, signerverifier.WithKMS(o.KMSKey, o.HashAlg))
+			default:
+				return nil, fmt.Errorf("unsupported signer options type: %T", opts)
+			}
+		}
+
+		// Check for hybrid mode (multiple signers via slices)
+		signerFilepaths := viper.GetStringSlice("signer-filepaths")
+		signerKMSKeys := viper.GetStringSlice("signer-kmskeys")
+
+		if len(signerFilepaths) > 0 || len(signerKMSKeys) > 0 {
+			// Hybrid mode using common setup
+			cfg := signersetup.Config{
+				FilePaths:    signerFilepaths,
+				Passwords:    viper.GetStringSlice("signer-passwords"),
+				KMSKeys:      signerKMSKeys,
+				KMSHashes:    viper.GetStringSlice("signer-kmshashes"),
+				CreateSigner: awsSignerFactory,
+			}
+
+			signers, err = signersetup.InitializeSigners(ctx, cfg)
+			if err != nil {
+				slog.Error("failed to initialize signers", "error", err)
+				os.Exit(1)
+			}
+		} else {
+			// Single signer mode (backwards compatible)
+			var signerOpts []signerverifier.Option
+			switch {
+			case viper.GetString("signer-filepath") != "":
+				signerOpts = []signerverifier.Option{signerverifier.WithFile(viper.GetString("signer-filepath"), viper.GetString("signer-password"))}
+			case viper.GetString("signer-kmskey") != "":
+				kmshash := viper.GetString("signer-kmshash")
+				hashAlg, ok := signersetup.HashAlgMap[kmshash]
+				if !ok {
+					slog.Error("invalid hash algorithm for --signer-kmshash", "algorithm", kmshash)
+					os.Exit(1)
+				}
+				signerOpts = []signerverifier.Option{signerverifier.WithKMS(viper.GetString("signer-kmskey"), hashAlg)}
+			case viper.GetString("signer-tink-kek-uri") != "":
+				signerOpts = []signerverifier.Option{signerverifier.WithTink(viper.GetString("signer-tink-kek-uri"), viper.GetString("signer-tink-keyset-path"))}
+			default:
+				slog.Error("no signer configured; must provide a signer using a file, KMS, or Tink")
 				os.Exit(1)
 			}
 
-			signerOpts = []signerverifier.Option{signerverifier.WithKMS(viper.GetString("signer-kmskey"), hashAlg)}
-		case viper.GetString("signer-tink-kek-uri") != "":
-			signerOpts = []signerverifier.Option{signerverifier.WithTink(viper.GetString("signer-tink-kek-uri"), viper.GetString("signer-tink-keyset-path"))}
-		default:
-			slog.Error("no signer configured; must provide a signer using a file, KMS, or Tink")
-			os.Exit(1)
+			signer, err := signerverifier.New(ctx, signerOpts...)
+			if err != nil {
+				slog.Error("failed to initialize signer", "error", err)
+				os.Exit(1)
+			}
+			signers = []signature.Signer{signer}
 		}
-		signer, err := signerverifier.New(ctx, signerOpts...)
-		if err != nil {
-			slog.Error("failed to initialize signer", "error", err)
-			os.Exit(1)
-		}
-		pubkey, err := signer.PublicKey()
-		if err != nil {
-			slog.Error("failed to get public key from signing key", "error", err)
-			os.Exit(1)
-		}
-		der, err := x509.MarshalPKIXPublicKey(pubkey)
-		if err != nil {
-			slog.Error("failed to marshal public key to DER", "error", err)
-			os.Exit(1)
-		}
-		slog.Info("Loaded signing key", "pubkey in base64 DER", base64.StdEncoding.EncodeToString(der))
 
-		appendOptions, err := tessera.NewAppendOptions(ctx, viper.GetString("hostname"), signer)
+		// Log all public keys for verification
+		if err := signersetup.LogPublicKeys(signers); err != nil {
+			slog.Error("failed to log public keys", "error", err)
+			os.Exit(1)
+		}
+
+		// Create append options with signers (handles both single and hybrid modes)
+		appendOptions, err := tessera.NewAppendOptionsMulti(ctx, viper.GetString("hostname"), signers)
 		if err != nil {
 			slog.Error("failed to initialize append options", "error", err)
 			os.Exit(1)
 		}
+
 		// Compute log ID for TransparencyLogEntry, to be used by clients to look up
 		// the correct instance in a trust root. Log ID is equivalent to the non-truncated
 		// hash of the public key and origin per the signed-note C2SP spec.
-		pubKey, err := signer.PublicKey(options.WithContext(ctx))
+		// Use the first signer's public key for backwards compatibility
+		pubKey, err := signers[0].PublicKey(options.WithContext(ctx))
 		if err != nil {
 			slog.Error("failed to get public key", "error", err)
 			os.Exit(1)
@@ -205,16 +242,15 @@ func init() {
 	serveCmd.Flags().String("signer-kmshash", "sha256", "hash algorithm used by the KMS")
 	serveCmd.Flags().String("signer-tink-kek-uri", "", "encryption key for decrypting Tink keyset, in the form aws-kms://keyname")
 	serveCmd.Flags().String("signer-tink-keyset-path", "", "path to encrypted Tink keyset")
+	// Hybrid signing configuration (multiple signers)
+	serveCmd.Flags().StringSlice("signer-filepaths", []string{}, "paths to signing keys (for hybrid mode)")
+	serveCmd.Flags().StringSlice("signer-passwords", []string{}, "passwords for signing keys (for hybrid mode)")
+	serveCmd.Flags().StringSlice("signer-kmskeys", []string{}, "KMS key URIs (for hybrid mode)")
+	serveCmd.Flags().StringSlice("signer-kmshashes", []string{}, "hash algorithms for KMS keys (for hybrid mode)")
 
 	if err := viper.BindPFlags(serveCmd.Flags()); err != nil {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
 	rootCmd.AddCommand(serveCmd)
-}
-
-var hashAlgMap = map[string]crypto.Hash{
-	"sha256": crypto.SHA256,
-	"sha384": crypto.SHA384,
-	"sha512": crypto.SHA512,
 }

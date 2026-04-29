@@ -27,6 +27,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"strings"
@@ -157,7 +158,12 @@ func KeyHash(origin string, key crypto.PublicKey) (uint32, []byte, error) {
 			return 0, nil, fmt.Errorf("getting RSA key hash: %w", err)
 		}
 	default:
-		return 0, nil, fmt.Errorf("unsupported key type: %T", key)
+		// Try PQ key hash (enabled when built with pq_circl or pq_openssl tags)
+		keyID, logID, err = tryPQKeyHash(origin, key)
+		//nolint:staticcheck // SA4023: stub always errors, but real impl may succeed
+		if err != nil {
+			return 0, nil, fmt.Errorf("unsupported key type: %T", key)
+		}
 	}
 
 	return keyID, logID, nil
@@ -216,4 +222,160 @@ func NewNoteVerifier(origin string, verifier signature.Verifier) (note.Verifier,
 			return true
 		},
 	}, nil
+}
+
+// multiNoteSigner uses multiple sigstore signers to implement note.Signer,
+// producing multiple signatures in the signed-note format for hybrid PQC support.
+type multiNoteSigner struct {
+	ctx     context.Context
+	origin  string
+	signers []signature.Signer
+	hashes  []uint32
+}
+
+// Name returns the server name associated with the signers.
+func (m *multiNoteSigner) Name() string {
+	return m.origin
+}
+
+// KeyHash returns the key hash of the first signer (for interface compatibility).
+// In hybrid mode, each signature in the note will have its own hash.
+func (m *multiNoteSigner) KeyHash() uint32 {
+	if len(m.hashes) == 0 {
+		return 0
+	}
+	return m.hashes[0]
+}
+
+// Sign produces multiple signatures for the given message, one per signer.
+// The returned bytes contain all signatures in the C2SP signed-note format.
+// Format:
+//
+//	<message>
+//
+//	— <origin> <hash1><sig1>
+//	— <origin> <hash2><sig2>
+//	...
+func (m *multiNoteSigner) Sign(msg []byte) ([]byte, error) {
+	if len(m.signers) == 0 {
+		return nil, fmt.Errorf("no signers configured")
+	}
+
+	n := &note.Note{Text: string(msg)}
+
+	noteSigners := make([]note.Signer, len(m.signers))
+	for i := range m.signers {
+		idx := i
+		noteSigners[i] = &noteSigner{
+			name: m.origin,
+			hash: m.hashes[idx],
+			sign: func(message []byte) ([]byte, error) {
+				sig, err := m.signers[idx].SignMessage(bytes.NewReader(message), options.WithContext(m.ctx))
+				if err != nil {
+					return nil, err
+				}
+				// Prepend the 4-byte hash to the signature (note format requirement)
+				var hbuf [4]byte
+				binary.BigEndian.PutUint32(hbuf[:], m.hashes[idx])
+				return append(hbuf[:], sig...), nil
+			},
+		}
+	}
+
+	return note.Sign(n, noteSigners...)
+}
+
+// NewMultiNoteSigner creates a note.Signer that signs with multiple sigstore signers.
+// This enables hybrid post-quantum signing where checkpoints are signed with both
+// classical (e.g., ECDSA) and post-quantum (e.g., ML-DSA) algorithms.
+//
+// All signers must share the same origin string.
+func NewMultiNoteSigner(ctx context.Context, origin string, signers []signature.Signer) (note.Signer, error) {
+	if !isValidName(origin) {
+		return nil, fmt.Errorf("invalid name %s", origin)
+	}
+	if len(signers) == 0 {
+		return nil, fmt.Errorf("no signers provided")
+	}
+
+	hashes := make([]uint32, len(signers))
+	for i, signer := range signers {
+		pubKey, err := signer.PublicKey()
+		if err != nil {
+			return nil, fmt.Errorf("getting public key for signer %d: %w", i, err)
+		}
+
+		keyID, _, err := KeyHash(origin, pubKey)
+		if err != nil {
+			return nil, fmt.Errorf("computing key hash for signer %d: %w", i, err)
+		}
+		hashes[i] = keyID
+	}
+
+	return &multiNoteSigner{
+		ctx:     ctx,
+		origin:  origin,
+		signers: signers,
+		hashes:  hashes,
+	}, nil
+}
+
+// VerifyAll checks that ALL provided verifiers have corresponding valid signatures.
+// This is the recommended verification method for hybrid signing mode, as it ensures
+// security from all signature algorithms (e.g., both ECDSA and ML-DSA must be valid).
+// Returns false if any verifier lacks a valid signature.
+func VerifyAll(signedNote []byte, verifiers []signature.Verifier) (bool, error) {
+	if len(verifiers) == 0 {
+		return false, fmt.Errorf("no verifiers provided")
+	}
+
+	n := &note.Note{}
+	if _, err := note.Open(signedNote, note.VerifierList()); err != nil {
+		return false, fmt.Errorf("parsing signed note: %w", err)
+	}
+
+	// Message is everything before the first signature line
+	msg := []byte(n.Text)
+
+	for vi, verifier := range verifiers {
+		pk, err := verifier.PublicKey()
+		if err != nil {
+			return false, fmt.Errorf("getting public key for verifier %d: %w", vi, err)
+		}
+
+		verifierPkHash, _, err := KeyHash(n.Sigs[0].Name, pk)
+		if err != nil {
+			return false, fmt.Errorf("computing key hash for verifier %d: %w", vi, err)
+		}
+
+		foundValid := false
+		for _, sig := range n.Sigs {
+			if sig.Hash != verifierPkHash {
+				continue
+			}
+
+			// Decode signature (4-byte hash + signature bytes)
+			fullSig, err := base64.StdEncoding.DecodeString(sig.Base64)
+			if err != nil {
+				continue
+			}
+			if len(fullSig) < 4 {
+				continue
+			}
+			sigBytes := fullSig[4:] // Skip hash prefix
+
+			if err := verifier.VerifySignature(bytes.NewReader(sigBytes), bytes.NewReader(msg)); err != nil {
+				continue
+			}
+
+			foundValid = true
+			break
+		}
+
+		if !foundValid {
+			return false, fmt.Errorf("no valid signature found for verifier %d", vi)
+		}
+	}
+
+	return true, nil
 }

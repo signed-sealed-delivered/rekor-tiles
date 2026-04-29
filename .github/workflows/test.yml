@@ -84,7 +84,7 @@ jobs:
           go-version-file: './go.mod'
           check-latest: true
       - name: Run Go tests
-        run: go test -covermode atomic -coverprofile coverage.txt $(go list ./... | grep -v third_party/)
+        run: go test -tags pq_circl -covermode atomic -coverprofile coverage.txt $(go list ./... | grep -v third_party/)
       - name: Workaround buggy Codecov OIDC auth
         run: |
           # only set CODECOV_TOKEN if OIDC token is available
@@ -103,7 +103,7 @@ jobs:
           # use_oidc: true
       - name: Run Go tests w/ `-race`
         if: ${{ runner.os == 'Linux' }}
-        run: go test -race $(go list ./... | grep -v third_party/)
+        run: go test -tags pq_circl -race $(go list ./... | grep -v third_party/)
 
   e2e-tests:
     name: Run E2E tests - ${{ matrix.storage.name }}
@@ -123,7 +123,7 @@ jobs:
       - name: Run ${{ matrix.storage.name }} docker compose
         run: docker compose -f ${{ matrix.storage.compose }} up -d --build --wait --wait-timeout 60
       - name: Run ${{ matrix.storage.name }} e2e tests
-        run: go test -v -tags=e2e -run ${{ matrix.storage.test }} ./tests/
+        run: go test -v -tags=pq_circl,e2e -run ${{ matrix.storage.test }} ./tests/
       - name: Stop ${{ matrix.storage.name }} docker compose
         run: docker compose -f ${{ matrix.storage.compose }} down --volumes
 
